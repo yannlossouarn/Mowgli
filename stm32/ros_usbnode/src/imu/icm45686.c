@@ -26,6 +26,13 @@ static icm45686_gyro_fs_sel_t icm45686_gyro_fs = ICM45686_GYRO_FS_SEL_250_DPS;
  * (probes ICM45686_ADDRESS then ICM45686_ADDRESS_ALT). Used by Init/reads. */
 static uint8_t icm45686_addr = ICM45686_ADDRESS;
 
+/* Boot-time accelerometer zero-g offset (m/s^2), subtracted from every read.
+ * Learned by ICM45686_CalibrateAccelBias() during init, assuming the robot is
+ * still and roughly level (gravity on Z) at power-up - which holds when it boots
+ * on the dock. Stays {0,0,0} if the boot sample doesn't look still & level, so a
+ * bad boot is never worse than the uncalibrated raw output. */
+static float icm45686_accel_bias[3] = { 0.0f, 0.0f, 0.0f };
+
 /* Registers used by the simple init sequence (from vendor regmap excerpts) */
 #define ICM45686_REG_MISC2         0x7F
 #define ICM45686_REG_PWR_MGMT0     0x10
@@ -48,6 +55,76 @@ uint8_t ICM45686_TestDevice(void)
   }
   debug_printf("    > [ICM-45686] - Error: not found at 0x%02x or 0x%02x\r\n", ICM45686_ADDRESS, ICM45686_ADDRESS_ALT);
   return 0;
+}
+
+/* Learn the accelerometer zero-g offset from a short still-and-level capture.
+ * Averaging cancels noise; we assume gravity sits on Z and treat any residual
+ * X/Y (and the Z error vs 1g) as bias. Guarded so it never bakes in motion or a
+ * non-level mount: on any failed check the bias is left at zero (raw output). */
+static void ICM45686_CalibrateAccelBias(void)
+{
+  const int      N          = 64;
+  const float    MAX_SPREAD = 1.0f;             /* m/s^2 peak-to-peak per axis  */
+  const float    MAG_LO     = 0.85f * MS2_PER_G;
+  const float    MAG_HI     = 1.15f * MS2_PER_G;
+  const float    MIN_Z      = 0.70f * MS2_PER_G; /* gravity must be on Z (level) */
+  const float    MAX_BIAS   = 3.0f;             /* sanity clamp, m/s^2          */
+
+  /* must be zero so the averaging reads return raw, uncorrected values */
+  icm45686_accel_bias[0] = 0.0f;
+  icm45686_accel_bias[1] = 0.0f;
+  icm45686_accel_bias[2] = 0.0f;
+
+  HAL_Delay(50); /* let the on-chip filters settle after config */
+
+  float sx = 0, sy = 0, sz = 0;
+  float minx =  1e9f, miny =  1e9f, minz =  1e9f;
+  float maxx = -1e9f, maxy = -1e9f, maxz = -1e9f;
+
+  for (int i = 0; i < N; i++) {
+    float x, y, z;
+    ICM45686_ReadAccelerometerRaw(&x, &y, &z);
+    sx += x; sy += y; sz += z;
+    if (x < minx) minx = x;
+    if (x > maxx) maxx = x;
+    if (y < miny) miny = y;
+    if (y > maxy) maxy = y;
+    if (z < minz) minz = z;
+    if (z > maxz) maxz = z;
+    HAL_Delay(10); /* ~ICM ODR (100 Hz) so samples are independent */
+  }
+
+  float mx = sx / N, my = sy / N, mz = sz / N;
+  float spread = fmaxf(maxx - minx, fmaxf(maxy - miny, maxz - minz));
+  float mag = sqrtf(mx * mx + my * my + mz * mz);
+
+  if (spread > MAX_SPREAD) {
+    debug_printf(" * ICM-45686 accel bias cal SKIPPED: motion (spread=%d mm/s2)\r\n", (int)(spread * 1000));
+    return;
+  }
+  if (mag < MAG_LO || mag > MAG_HI) {
+    debug_printf(" * ICM-45686 accel bias cal SKIPPED: |a|=%d mm/s2 not ~1g\r\n", (int)(mag * 1000));
+    return;
+  }
+  if (fabsf(mz) < MIN_Z) {
+    debug_printf(" * ICM-45686 accel bias cal SKIPPED: not level (z=%d mm/s2)\r\n", (int)(mz * 1000));
+    return;
+  }
+
+  float bx = mx;
+  float by = my;
+  float bz = mz - copysignf(MS2_PER_G, mz); /* gravity may rest on +Z or -Z */
+
+  if (fabsf(bx) > MAX_BIAS || fabsf(by) > MAX_BIAS || fabsf(bz) > MAX_BIAS) {
+    debug_printf(" * ICM-45686 accel bias cal SKIPPED: bias out of range\r\n");
+    return;
+  }
+
+  icm45686_accel_bias[0] = bx;
+  icm45686_accel_bias[1] = by;
+  icm45686_accel_bias[2] = bz;
+  debug_printf(" * ICM-45686 accel bias learned (mm/s2): x=%d y=%d z=%d\r\n",
+               (int)(bx * 1000), (int)(by * 1000), (int)(bz * 1000));
 }
 
 void ICM45686_Init(void)
@@ -117,6 +194,9 @@ void ICM45686_Init(void)
   }
 
   debug_printf(" * ICM-45686 configured (soft-reset, pwr_mgmt, accel/gyro cfg)\r\n");
+
+  /* Robot should be still on the dock right now: learn the accel zero-g offset. */
+  ICM45686_CalibrateAccelBias();
 }
 
 void ICM45686_ReadAccelerometerRaw(float *x, float *y, float *z)
@@ -130,9 +210,9 @@ void ICM45686_ReadAccelerometerRaw(float *x, float *y, float *z)
     int16_t rx = (int16_t)(accel_xyz[1] << 8 | accel_xyz[0]);
     int16_t ry = (int16_t)(accel_xyz[3] << 8 | accel_xyz[2]);
     int16_t rz = (int16_t)(accel_xyz[5] << 8 | accel_xyz[4]);
-    *x = rx * icm45686_g_per_lsb * MS2_PER_G;
-    *y = ry * icm45686_g_per_lsb * MS2_PER_G;
-    *z = rz * icm45686_g_per_lsb * MS2_PER_G;
+    *x = rx * icm45686_g_per_lsb * MS2_PER_G - icm45686_accel_bias[0];
+    *y = ry * icm45686_g_per_lsb * MS2_PER_G - icm45686_accel_bias[1];
+    *z = rz * icm45686_g_per_lsb * MS2_PER_G - icm45686_accel_bias[2];
   }
 }
 
